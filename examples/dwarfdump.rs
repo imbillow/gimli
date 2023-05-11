@@ -2,7 +2,10 @@
 #![allow(unknown_lints)]
 
 use fallible_iterator::FallibleIterator;
-use gimli::{Section, UnitHeader, UnitOffset, UnitSectionOffset, UnitType, UnwindSection};
+use gimli::{
+    EvaluationResult, Location, Section, UnitHeader, UnitOffset, UnitSectionOffset, UnitType,
+    UnwindSection, Value,
+};
 use object::{Object, ObjectSection, ObjectSymbol};
 use regex::bytes::Regex;
 use std::borrow::{Borrow, Cow};
@@ -11,6 +14,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::{self, Debug};
 use std::fs;
+use std::fs::read_to_string;
 use std::io;
 use std::io::{BufWriter, Write};
 use std::iter::Iterator;
@@ -248,40 +252,6 @@ impl<'a, R: gimli::Reader<Offset = usize>> gimli::Reader for Relocate<'a, R> {
     type Endian = R::Endian;
     type Offset = R::Offset;
 
-    fn read_address(&mut self, address_size: u8) -> gimli::Result<u64> {
-        let offset = self.reader.offset_from(&self.section);
-        let value = self.reader.read_address(address_size)?;
-        Ok(self.relocate(offset, value))
-    }
-
-    fn read_length(&mut self, format: gimli::Format) -> gimli::Result<usize> {
-        let offset = self.reader.offset_from(&self.section);
-        let value = self.reader.read_length(format)?;
-        <usize as gimli::ReaderOffset>::from_u64(self.relocate(offset, value as u64))
-    }
-
-    fn read_offset(&mut self, format: gimli::Format) -> gimli::Result<usize> {
-        let offset = self.reader.offset_from(&self.section);
-        let value = self.reader.read_offset(format)?;
-        <usize as gimli::ReaderOffset>::from_u64(self.relocate(offset, value as u64))
-    }
-
-    fn read_sized_offset(&mut self, size: u8) -> gimli::Result<usize> {
-        let offset = self.reader.offset_from(&self.section);
-        let value = self.reader.read_sized_offset(size)?;
-        <usize as gimli::ReaderOffset>::from_u64(self.relocate(offset, value as u64))
-    }
-
-    #[inline]
-    fn split(&mut self, len: Self::Offset) -> gimli::Result<Self> {
-        let mut other = self.clone();
-        other.reader.truncate(len)?;
-        self.reader.skip(len)?;
-        Ok(other)
-    }
-
-    // All remaining methods simply delegate to `self.reader`.
-
     #[inline]
     fn endian(&self) -> Self::Endian {
         self.reader.endian()
@@ -307,6 +277,8 @@ impl<'a, R: gimli::Reader<Offset = usize>> gimli::Reader for Relocate<'a, R> {
         self.reader.offset_from(&base.reader)
     }
 
+    // All remaining methods simply delegate to `self.reader`.
+
     #[inline]
     fn offset_id(&self) -> gimli::ReaderOffsetId {
         self.reader.offset_id()
@@ -328,6 +300,14 @@ impl<'a, R: gimli::Reader<Offset = usize>> gimli::Reader for Relocate<'a, R> {
     }
 
     #[inline]
+    fn split(&mut self, len: Self::Offset) -> gimli::Result<Self> {
+        let mut other = self.clone();
+        other.reader.truncate(len)?;
+        self.reader.skip(len)?;
+        Ok(other)
+    }
+
+    #[inline]
     fn to_slice(&self) -> gimli::Result<Cow<[u8]>> {
         self.reader.to_slice()
     }
@@ -345,6 +325,30 @@ impl<'a, R: gimli::Reader<Offset = usize>> gimli::Reader for Relocate<'a, R> {
     #[inline]
     fn read_slice(&mut self, buf: &mut [u8]) -> gimli::Result<()> {
         self.reader.read_slice(buf)
+    }
+
+    fn read_address(&mut self, address_size: u8) -> gimli::Result<u64> {
+        let offset = self.reader.offset_from(&self.section);
+        let value = self.reader.read_address(address_size)?;
+        Ok(self.relocate(offset, value))
+    }
+
+    fn read_length(&mut self, format: gimli::Format) -> gimli::Result<usize> {
+        let offset = self.reader.offset_from(&self.section);
+        let value = self.reader.read_length(format)?;
+        <usize as gimli::ReaderOffset>::from_u64(self.relocate(offset, value as u64))
+    }
+
+    fn read_offset(&mut self, format: gimli::Format) -> gimli::Result<usize> {
+        let offset = self.reader.offset_from(&self.section);
+        let value = self.reader.read_offset(format)?;
+        <usize as gimli::ReaderOffset>::from_u64(self.relocate(offset, value as u64))
+    }
+
+    fn read_sized_offset(&mut self, size: u8) -> gimli::Result<usize> {
+        let offset = self.reader.offset_from(&self.section);
+        let value = self.reader.read_sized_offset(size)?;
+        <usize as gimli::ReaderOffset>::from_u64(self.relocate(offset, value as u64))
     }
 }
 
@@ -1218,11 +1222,11 @@ fn dump_unit<R: Reader, W: Write>(
         }
     }
     writeln!(w, ">: length = 0x{:x}, format = {:?}, version = {}, address_size = {}, abbrev_offset = 0x{:x}",
-        header.unit_length(),
-        header.format(),
-        header.version(),
-        header.address_size(),
-        header.debug_abbrev_offset().0,
+             header.unit_length(),
+             header.format(),
+             header.version(),
+             header.address_size(),
+             header.debug_abbrev_offset().0,
     )?;
 
     match header.type_() {
@@ -1310,6 +1314,7 @@ fn dump_entries<R: Reader, W: Write>(
         let offset = entries.next_offset();
         let depth = entries.next_depth();
         let abbrev = entries.read_abbreviation()?;
+        let die = unit.entries_at_offset(offset)?.current().unwrap();
 
         let mut indent = if depth >= 0 {
             depth as usize * 2 + 2
@@ -1342,7 +1347,7 @@ fn dump_entries<R: Reader, W: Write>(
             if flags.raw {
                 writeln!(w, "{:?}", attr.raw_value())?;
             } else {
-                match dump_attr_value(w, &attr, &unit, dwarf) {
+                match dump_attr_value(w, &attr, &unit, dwarf, die) {
                     Ok(_) => (),
                     Err(err) => writeln_error(w, dwarf, err, "Failed to dump attribute value")?,
                 };
@@ -1357,6 +1362,7 @@ fn dump_attr_value<R: Reader, W: Write>(
     attr: &gimli::Attribute<R>,
     unit: &gimli::Unit<R>,
     dwarf: &gimli::Dwarf<R>,
+    die: &gimli::DebuggingInformationEntry<R>,
 ) -> Result<()> {
     let value = attr.value();
     match value {
@@ -1431,7 +1437,9 @@ fn dump_attr_value<R: Reader, W: Write>(
                 }
                 write!(w, ": ")?;
             }
-            dump_exprloc(w, unit.encoding(), data)?;
+
+            dump_exprloc(w, unit.encoding(), data, die)?;
+
             writeln!(w)?;
         }
         gimli::AttributeValue::Flag(true) => {
@@ -1643,12 +1651,41 @@ fn dump_file_index<R: Reader, W: Write>(
     Ok(())
 }
 
+fn eval_expr<R: Reader>(
+    r: R,
+    encoding: gimli::Encoding,
+    die: &gimli::DebuggingInformationEntry<R>,
+) -> Result<Vec<gimli::Piece<R, usize>>> {
+    let mut eval = gimli::Evaluation::new(r, encoding);
+    loop {
+        match eval.evaluate()? {
+            EvaluationResult::Complete => {
+                return Ok(eval.result());
+            }
+            EvaluationResult::RequiresFrameBase => {
+                let fb0 = die.attr_value(gimli::DW_AT_frame_base)?.unwrap();
+                let fb1 = fb0.exprloc_value().unwrap();
+                let fb2 = eval_expr(fb1.0, encoding, die)?;
+                let Location::Value { value: x } = fb2[0].location;
+                let Value::U64(x) = x;
+                eval.resume_with_frame_base(x);
+            }
+            EvaluationResult::RequiresCallFrameCfa => {
+                let cfa = get_call_frame_cfa();
+                eval.resume_with_call_frame_cfa(cfa);
+            }
+            _ => unimplemented!(),
+        }
+    }
+}
+
 fn dump_exprloc<R: Reader, W: Write>(
     w: &mut W,
     encoding: gimli::Encoding,
     data: &gimli::Expression<R>,
+    die: &gimli::DebuggingInformationEntry<R>,
 ) -> Result<()> {
-    let mut pc = data.0.clone();
+    let mut pc: R = data.0.clone();
     let mut space = false;
     while pc.len() != 0 {
         let pc_clone = pc.clone();
@@ -1659,6 +1696,9 @@ fn dump_exprloc<R: Reader, W: Write>(
                 } else {
                     space = true;
                 }
+
+                // write!(w, "{:#?} :", res)?;
+
                 dump_op(w, encoding, pc_clone, op)?;
             }
             Err(gimli::Error::InvalidExpression(op)) => {
@@ -1687,6 +1727,7 @@ fn dump_op<R: Reader, W: Write>(
     encoding: gimli::Encoding,
     mut pc: R,
     op: gimli::Operation<R>,
+    die: &gimli::DebuggingInformationEntry<R>,
 ) -> Result<()> {
     let dwop = gimli::DwOp(pc.read_u8()?);
     write!(w, "{}", dwop)?;
@@ -1794,7 +1835,7 @@ fn dump_op<R: Reader, W: Write>(
         }
         gimli::Operation::EntryValue { expression } => {
             write!(w, "(")?;
-            dump_exprloc(w, encoding, &gimli::Expression(expression))?;
+            dump_exprloc(w, encoding, &gimli::Expression(expression), die)?;
             write!(w, ")")?;
         }
         gimli::Operation::ParameterRef { offset } => {
@@ -1873,6 +1914,7 @@ fn dump_loc_list<R: Reader, W: Write>(
     offset: gimli::LocationListsOffset<R::Offset>,
     unit: &gimli::Unit<R>,
     dwarf: &gimli::Dwarf<R>,
+    die: &gimli::DebuggingInformationEntry<R>,
 ) -> Result<()> {
     let mut locations = dwarf.locations(unit, offset)?;
     writeln!(
@@ -1913,7 +1955,7 @@ fn dump_loc_list<R: Reader, W: Write>(
                     begin.0, begin_val, end.0, end_val,
                 )?;
                 dump_range(w, range)?;
-                dump_exprloc(w, unit.encoding(), data)?;
+                dump_exprloc(w, unit.encoding(), data, die)?;
                 writeln!(w)?;
             }
             gimli::RawLocListEntry::StartxLength {
@@ -2291,12 +2333,12 @@ fn dump_pubnames<R: Reader, W: Write>(
         let die_in_cu = pubname.die_offset();
         let die_in_sect = cu_offset.0 + die_in_cu.0;
         writeln!(w,
-            "global die-in-sect 0x{:08x}, cu-in-sect 0x{:08x}, die-in-cu 0x{:08x}, cu-header-in-sect 0x{:08x} '{}'",
-            die_in_sect,
-            cu_die_offset.0,
-            die_in_cu.0,
-            cu_offset.0,
-            pubname.name().to_string_lossy()?
+                 "global die-in-sect 0x{:08x}, cu-in-sect 0x{:08x}, die-in-cu 0x{:08x}, cu-header-in-sect 0x{:08x} '{}'",
+                 die_in_sect,
+                 cu_die_offset.0,
+                 die_in_cu.0,
+                 cu_offset.0,
+                 pubname.name().to_string_lossy()?
         )?;
     }
     Ok(())
@@ -2323,12 +2365,12 @@ fn dump_pubtypes<R: Reader, W: Write>(
         let die_in_cu = pubtype.die_offset();
         let die_in_sect = cu_offset.0 + die_in_cu.0;
         writeln!(w,
-            "pubtype die-in-sect 0x{:08x}, cu-in-sect 0x{:08x}, die-in-cu 0x{:08x}, cu-header-in-sect 0x{:08x} '{}'",
-            die_in_sect,
-            cu_die_offset.0,
-            die_in_cu.0,
-            cu_offset.0,
-            pubtype.name().to_string_lossy()?
+                 "pubtype die-in-sect 0x{:08x}, cu-in-sect 0x{:08x}, die-in-cu 0x{:08x}, cu-header-in-sect 0x{:08x} '{}'",
+                 die_in_sect,
+                 cu_die_offset.0,
+                 die_in_cu.0,
+                 cu_offset.0,
+                 pubtype.name().to_string_lossy()?
         )?;
     }
     Ok(())
